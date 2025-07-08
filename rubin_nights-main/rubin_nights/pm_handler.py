@@ -249,7 +249,7 @@ async def maintenance_loop(token):
                 pm_exists, existing_pm_id = await check_existing_active_pm(client, token, config_id)
                 if pm_exists:
                     print(
-                        f"[INFO] ✅ Existing PM found for config {config_id} → PM ID: {existing_pm_id}"
+                        f"[INFO] Existing PM found for config {config_id} → PM ID: {existing_pm_id}"
                     )
                     continue
 
@@ -257,7 +257,7 @@ async def maintenance_loop(token):
                 if not pm_id:
                     continue
 
-                print(f"[PM] ✅ New PM created with ID {pm_id}")
+                print(f"[PM] New PM created with ID {pm_id}")
                 if await advance_pm(client, token, pm_id):
                     print(f"[PM] PM {pm_id} advanced to 'planning' status")
 
