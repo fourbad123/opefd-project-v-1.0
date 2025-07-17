@@ -24,77 +24,104 @@ import os
 from datetime import datetime
 
 import pytz
+import pandas as pd
 
 from influx_query import EfdQueryClient
 
 CHILE_TZ = pytz.timezone("America/Santiago")
 
 
-def get_shutter_activations(site, db_name, measurement, time_interval="24h"):
+def get_shutter_activations(site: str, db_name: str, measurement: str, time_interval: str = "24h") -> int:
     """
-    Queries InfluxDB to get the number of shutter activations
-    in the specified time interval.
+    Count the number of shutter activations
+    where positionActual0 or positionActual1 > 90
+    within a given time interval from InfluxDB.
+
+    Args:
+        site (str): Observatory site identifier.
+        db_name (str): Name of the InfluxDB database.
+        measurement (str): Measurement name in InfluxDB.
+        time_interval (str): Time interval to query (e.g. "24h").
+
+    Returns:
+        int: Number of detected shutter activations.
     """
     try:
         client = EfdQueryClient(site=site, db_name=db_name)
-        query = f'''
-            SELECT "positionActual0", "positionActual1"
-            FROM "{measurement}"
-            WHERE time > now() - {time_interval}
-            ORDER BY time ASC
-        '''
-        result = client.query(query)
+
+        query = (
+            f'SELECT "positionActual0", "positionActual1" '
+            f'FROM "{measurement}" '
+            f'WHERE time > now() - {time_interval} '
+            f'ORDER BY time ASC'
+        )
+
+        result: pd.DataFrame = client.query(query)
 
         if result.empty:
-            print("[DEBUG] No shutter data found in the interval.")
+            print(f"[DEBUG] No shutter data in the last {time_interval}.")
             return 0
 
-        activity = (result["positionActual0"] > 90) | \
-                   (result["positionActual1"] > 90)
-        activity = activity.infer_objects(copy=False).astype(bool)
+        # Activation condition: either positionActual0 or positionActual1 > 90
+        activity = (result["positionActual0"] > 90) | (result["positionActual1"] > 90)
+        activity = activity.astype(bool)
 
-        activations = activity.astype(bool) & (~activity.shift(1).fillna(False).astype(bool))
+        # Count rising edges (from False to True)
+        activations = activity & (~activity.shift(1).fillna(False))
+        count_activations = int(activations.sum())
 
-        count_activations = activations.sum()
-
-        print(
-            f"[DEBUG] Shutter activations >90% in the last {time_interval}: "
-            f"{count_activations}"
-        )
+        print(f"[DEBUG] Shutter activations >90% in last {time_interval}: {count_activations}")
         return count_activations
 
     except Exception as e:
-        print(f"[ERROR SHUTTER] {e}")
+        print(f"[ERROR SHUTTER] Failed to query or process shutter data: {e}")
         return 0
 
 
-def load_last_activation(asset_id):
+def load_last_activation(asset_id: str) -> int:
     """
-    Loads the previous number of activations from a JSON file.
+    Load the last saved shutter activation count
+    for a given asset from a local JSON file.
+
+    Args:
+        asset_id (str): Asset identifier.
+
+    Returns:
+        int: Last recorded activation count,
+        or 0 if not found or failed to read.
     """
     path = f"activations_{asset_id}.json"
     if os.path.exists(path):
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-                return data.get("last_activations", 0)
+                last_activations = data.get("last_activations", 0)
+                if isinstance(last_activations, dict):
+                    last_activations=last_activations.get("value",0)if isinstance(last_activations,dict)else 0
+                return int(last_activations)
+            print("Last shutter activations in 24h: " + last_activations)
         except Exception as e:
-            print(f"[ERROR LOAD] Failed to read activation file {path}: {e}")
+            print(f"[ERROR LOAD] Could not read activation file '{path}': {e}")
             return 0
     return 0
 
 
-def save_last_activation(asset_id, count):
+def save_last_activation(asset_id: str, count: int) -> None:
     """
-    Saves the current number of activations to a JSON file.
+    Save the latest shutter activation count and timestamp for a given asset.
+
+    Args:
+        asset_id (str): Asset identifier.
+        count (int): Current number of shutter activations.
     """
     path = f"activations_{asset_id}.json"
     data = {
         "last_activations": int(count),
         "last_update": datetime.now(CHILE_TZ).strftime("%Y-%m-%dT%H:%M:%S")
     }
+
     try:
         with open(path, "w") as f:
             json.dump(data, f, indent=4)
     except Exception as e:
-        print(f"[ERROR SAVE] Failed to write activation file {path}: {e}")
+        print(f"[ERROR SAVE] Could not write activation file '{path}': {e}")
