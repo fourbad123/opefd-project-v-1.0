@@ -34,47 +34,79 @@ from shutter_counter import (
     save_last_activation,
 )
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
 ASSET_ENDPOINT = os.getenv("CMMS_ASSET_ENDPOINT")
 CHILE_TZ = pytz.timezone("America/Santiago")
 
-
-def timestamp():
-    return datetime.now(CHILE_TZ).strftime("%Y-%m-%d %H:%M:%S")
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
-def query_influx_value(
-    client_efd,
-    field,
-    measurement,
-    interval,
-    sal_index=None
-):
+def current_timestamp() -> str:
+    """Return the current timestamp formatted with Chile timezone."""
+    return datetime.now(CHILE_TZ).strftime(LOG_TIME_FORMAT)
+
+
+def query_latest_influx_value(
+    client_efd: EfdQueryClient,
+    measurement: str,
+    field: str,
+    interval: str,
+    sal_index: int | None = None
+) -> float | None:
+    """
+    Query the latest value from InfluxDB.
+
+    Args:
+        client_efd: Instance of EfdQueryClient.
+        measurement: Measurement name in InfluxDB.
+        field: Field to query.
+        interval: Time interval string for query.
+        sal_index: Optional SAL index filter.
+
+    Returns:
+        The latest float value or None if not found.
+    """
     if sal_index is not None:
         query = (
-            f'SELECT "{field}" '
-            f'FROM "{measurement}" '
-            f'WHERE time > now() - {interval} '
-            f'AND "salIndex" = {sal_index} '
+            f'SELECT "{field}" FROM "{measurement}" '
+            f'WHERE time > now() - {interval} AND "salIndex" = {sal_index} '
             f'ORDER BY time DESC LIMIT 1'
         )
-        print(f"{timestamp()} [INFO] Executing query with salIndex={sal_index}")
+        print(f"{current_timestamp()} [INFO] Executing InfluxDB query with salIndex={sal_index}")
     else:
         query = (
-            f'SELECT "{field}" '
-            f'FROM "{measurement}" '
+            f'SELECT "{field}" FROM "{measurement}" '
             f'WHERE time > now() - {interval} '
             f'ORDER BY time DESC LIMIT 1'
         )
-        print(f"{timestamp()} [INFO] Executing query without salIndex")
+        print(f"{current_timestamp()} [INFO] Executing InfluxDB query without salIndex")
 
     result = client_efd.query(query)
-    return result.iloc[0][field] if not result.empty else None
+    if not result.empty:
+        return result.iloc[0][field]
+    return None
 
 
-async def get_cmms_attribute(client, token, asset_id, attribute):
+async def get_cmms_attribute(
+    client: httpx.AsyncClient,
+    token: str,
+    asset_id: str | int,
+    attribute: str
+) -> int | float | None:
+    """
+    Fetch the current attribute value from CMMS asset.
+
+    Args:
+        client: httpx AsyncClient instance.
+        token: Authentication token.
+        asset_id: Asset ID in CMMS.
+        attribute: Attribute name to fetch.
+
+    Returns:
+        Attribute value or None on error.
+    """
     url = f"{ASSET_ENDPOINT}/{asset_id}"
     headers = {"CMDBuild-Authorization": token}
 
@@ -82,13 +114,29 @@ async def get_cmms_attribute(client, token, asset_id, attribute):
         response = await client.get(url, headers=headers)
         response.raise_for_status()
         data = response.json().get("data", {})
-        return data.get(attribute, 0)
-    except Exception as e:
-        print(f"{timestamp()} [ERROR CMMS] Failed to get {attribute} from {asset_id}: {e}")
-        return 0
+        return data.get(attribute, None)
+    except Exception as err:
+        print(f"{current_timestamp()} [ERROR CMMS] Failed to get '{attribute}' from asset {asset_id}: {err}")
+        return None
 
 
-async def update_cmms_value(client, token, asset_id, attribute, value):
+async def update_cmms_attribute(
+    client: httpx.AsyncClient,
+    token: str,
+    asset_id: str | int,
+    attribute: str,
+    value: int | float
+) -> None:
+    """
+    Update attribute value on CMMS asset.
+
+    Args:
+        client: httpx AsyncClient instance.
+        token: Authentication token.
+        asset_id: Asset ID in CMMS.
+        attribute: Attribute name to update.
+        value: New value to set.
+    """
     url = f"{ASSET_ENDPOINT}/{asset_id}"
     headers = {
         "CMDBuild-Authorization": token,
@@ -97,79 +145,100 @@ async def update_cmms_value(client, token, asset_id, attribute, value):
     payload = {attribute: int(value)}
 
     try:
-        response = await client.put(url, json=payload, headers=headers)
+        response = await client.put(url, headers=headers, json=payload)
         response.raise_for_status()
-        print(f"{timestamp()} [CMMS] Updated {attribute}={value} for asset {asset_id}")
-    except Exception as e:
-        print(f"{timestamp()} [ERROR CMMS] Failed to update asset {asset_id}: {e}")
+        print(f"{current_timestamp()} [CMMS] Updated {attribute}={value} for asset {asset_id}")
+    except Exception as err:
+        print(f"{current_timestamp()} [ERROR CMMS] Failed to update asset {asset_id}: {err}")
 
 
-async def monitor_subsystem(token, site, db_name, cfg):
-    measurement = cfg["measurement"]
-    field = cfg["field"]
-    asset_id = cfg["asset_id"]
-    attribute = cfg["attribute"]
-    interval = cfg.get("time_interval", "24h")
-    client_db = cfg.get("db_name", db_name)
-    client_efd = EfdQueryClient(site=site, db_name=client_db)
+async def monitor_subsystem(
+    token: str,
+    site: str,
+    db_name: str,
+    config: dict
+) -> None:
+    """
+    Main async loop to monitor a subsystem and update CMMS accordingly.
 
-    last_cmms_count = None
-    last_activations = None
+    Args:
+        token: CMMS authentication token.
+        site: Site name or identifier.
+        db_name: Database name for EFD queries.
+        config: Configuration dictionary with keys:
+            - measurement
+            - field
+            - asset_id
+            - attribute
+            - time_interval (optional)
+            - salIndex (optional)
+    """
+    measurement = config["measurement"]
+    field = config["field"]
+    asset_id = config["asset_id"]
+    attribute = config["attribute"]
+    interval = config.get("time_interval", "24h")
+    influx_db_name = config.get("db_name", db_name)
+    client_efd = EfdQueryClient(site=site, db_name=influx_db_name)
 
-    # Aquí creamos el cliente HTTP con verify=False para toda la sesión
-    async with httpx.AsyncClient(verify=False) as client_http:
+    last_cmms_value = None
+    last_activation_count = None
+
+    async with httpx.AsyncClient(verify=False) as http_client:
         while True:
-            if (
-                attribute == "AC_count"
-                and measurement == "lsst.sal.MTDome.apertureShutter"
-            ):
-                value = get_shutter_activations(site, client_db, measurement, interval)
-                cmms_current = await get_cmms_attribute(
-                    client_http, token, asset_id, attribute
-                )
+            if attribute == "AC_count" and measurement == "lsst.sal.MTDome.apertureShutter":
+                activation_count = get_shutter_activations(site, influx_db_name, measurement, interval)
+                cmms_value = await get_cmms_attribute(http_client, token, asset_id, attribute)
 
-                if last_cmms_count is None:
-                    last_cmms_count = cmms_current
-                    last_activations = load_last_activation(asset_id)
+                # Aquí la corrección para evitar sumas con None
+                if cmms_value is None:
+                    cmms_value = 0
 
-                    print(f"{timestamp()} [INFO] First cycle. CMMS: {cmms_current}, detected activations: {value}")
+                if last_cmms_value is None:
+                    last_cmms_value = cmms_value
+                    last_activation_count = load_last_activation(asset_id)
 
-                    new_activations = value - last_activations
+                    print(f"{current_timestamp()}CMMS value={cmms_value}shutter act.={activation_count}")
+
+                    new_activations = activation_count - last_activation_count
                     if new_activations > 0:
-                        new_total = cmms_current + new_activations
-                        await update_cmms_value(client_http, token, asset_id, attribute, new_total)
-                        save_last_activation(asset_id, value)
-                        last_cmms_count = new_total
-
-                        print(f"{timestamp()} [INFO] CMMS updated with {new_total} (added {new_activations})")
+                        updated_value = cmms_value + new_activations
+                        await update_cmms_attribute(http_client, token, asset_id, attribute, updated_value)
+                        save_last_activation(asset_id, activation_count)
+                        last_cmms_value = updated_value
+                        print(f"{current_timestamp()}updated to {updated_value} (added {new_activations})")
                     else:
-                        print(f"{timestamp()} [INFO] No new activations to add")
+                        print(f"{current_timestamp()} [INFO] No new shutter activations detected.")
                 else:
-                    if value > last_activations:
-                        new_activations = value - last_activations
-                        new_total = last_cmms_count + new_activations
+                    if activation_count > last_activation_count:
+                        new_activations = activation_count - last_activation_count
+                        updated_value = last_cmms_value + new_activations
+                        print(
+                            f"{current_timestamp()}{new_activations}new activations,updating{updated_value}"
+                            )
 
-                        print(f"{timestamp()} [INFO] New activations detected: {new_activations} → total: {new_total}")
-
-                        await update_cmms_value(client_http, token, asset_id, attribute, new_total)
-                        save_last_activation(asset_id, value)
-                        last_cmms_count = new_total
-                        last_activations = value
+                        await update_cmms_attribute(http_client, token, asset_id, attribute, updated_value)
+                        save_last_activation(asset_id, activation_count)
+                        last_cmms_value = updated_value
+                        last_activation_count = activation_count
                     else:
-                        print(f"{timestamp()} [INFO] No new activations (current value: {value})")
+                        print(f"{current_timestamp()} No new activations, current count: {activation_count})")
+
             else:
                 try:
-                    value = query_influx_value(
-                        client_efd=client_efd,
-                        field=field,
-                        measurement=measurement,
-                        interval=interval,
-                        sal_index=cfg.get("salIndex")
+                    value = query_latest_influx_value(
+                        client_efd,
+                        measurement,
+                        field,
+                        interval,
+                        sal_index=config.get("salIndex")
                     )
-                    print(f"{timestamp()} [INFO] {measurement}.{field} = {value}")
-                    await update_cmms_value(client_http, token, asset_id, attribute, value)
-                except Exception as e:
-                    print(f"{timestamp()} [ERROR EFD] {e}")
+                    if value is not None:
+                        print(f"{current_timestamp()} [INFO] {measurement}.{field} = {value}")
+                        await update_cmms_attribute(http_client, token, asset_id, attribute, value)
+                    else:
+                        print(f"{current_timestamp()} [WARN] No value returned for {measurement}.{field}")
+                except Exception as err:
+                    print(f"{current_timestamp()} [ERROR EFD] Query failed: {err}")
 
             await asyncio.sleep(60)
-
